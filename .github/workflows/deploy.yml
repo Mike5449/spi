@@ -1,0 +1,71 @@
+name: Deploy to VPS
+
+# Se déclenche à chaque push sur main + manuellement depuis l'onglet Actions.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Une seule exécution à la fois (évite les déploiements concurrents).
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy on VPS Hostinger
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Setup SSH client
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/ci_key
+          chmod 600 ~/.ssh/ci_key
+          ssh-keyscan -p ${{ secrets.VPS_PORT || '22' }} -H ${{ secrets.VPS_HOST }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy on VPS
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_PORT: ${{ secrets.VPS_PORT || '22' }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/spi' }}
+        run: |
+          ssh -i ~/.ssh/ci_key -p "$VPS_PORT" "$VPS_USER@$VPS_HOST" bash <<'REMOTE'
+            set -euo pipefail
+            cd "${DEPLOY_PATH:-/opt/spi}"
+
+            echo "▶ Pulling latest main..."
+            git fetch origin main
+            git reset --hard origin/main
+
+            echo "▶ Building + restarting stack..."
+            docker compose up -d --build
+
+            echo "▶ Pruning dangling images..."
+            docker image prune -f
+
+            echo "▶ Waiting for health (max 90s)..."
+            for i in {1..18}; do
+              if docker compose ps --format '{{.Service}} {{.Health}}' | grep -E '^(backend|db|web)' | awk '{print $2}' | grep -qE 'starting|unhealthy|^$'; then
+                echo "  …still starting ($((i*5))s)"
+                sleep 5
+              else
+                echo "  ✓ All services healthy"
+                break
+              fi
+            done
+
+            echo "▶ Final status:"
+            docker compose ps
+
+            echo "▶ Health endpoint:"
+            curl -fsS http://127.0.0.1/api/health || (echo "❌ Health check failed"; exit 1)
+
+            echo "✓ Deployment complete"
+          REMOTE
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/ci_key
