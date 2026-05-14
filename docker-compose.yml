@@ -1,0 +1,89 @@
+# ----------------------------------------------------------------
+# SPI — Stack de production
+#
+# 3 conteneurs :
+#   db      ← Postgres 15 (volume persistant)
+#   backend ← FastAPI / uvicorn (interne, port 8000)
+#   web     ← nginx servant le SPA Vite + proxy /api/* vers backend
+#
+# Le seul conteneur exposé sur l'hôte est `web` (par défaut sur 80).
+# Sur un VPS qui héberge déjà d'autres sites, change WEB_PORT=8080
+# dans .env et laisse le nginx hôte faire le forwarding.
+#
+# Quick start :
+#   cp .env.example .env
+#   nano .env             # remplir POSTGRES_PASSWORD, SECRET_KEY, FERNET_KEY, …
+#   docker compose up -d --build
+#   docker compose exec backend python -m scripts.promote_admin <username>
+# ----------------------------------------------------------------
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: spi-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-spi}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD manquant dans .env}
+      POSTGRES_DB: ${POSTGRES_DB:-spi}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Bound to localhost UNIQUEMENT — jamais 0.0.0.0 sur Internet
+    ports:
+      - "127.0.0.1:${DB_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    image: spi-backend:latest
+    container_name: spi-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-spi}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-spi}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY manquant dans .env}
+      FERNET_KEY: ${FERNET_KEY:?FERNET_KEY manquant dans .env}
+      ALGORITHM: ${ALGORITHM:-HS256}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      MONCASH_CLIENT_ID: ${MONCASH_CLIENT_ID:-}
+      MONCASH_CLIENT_SECRET: ${MONCASH_CLIENT_SECRET:-}
+      MONCASH_ENVIRONMENT: ${MONCASH_ENVIRONMENT:-sandbox}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,http://127.0.0.1}
+    volumes:
+      - backend_uploads:/app/uploads
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        # Variables Vite injectées au build (le bundle est immuable après).
+        # En prod : "/api" → traversé par notre nginx vers backend.
+        VITE_API_URL: ${VITE_API_URL:-/api}
+    image: spi-web:latest
+    container_name: spi-web
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      # WEB_PORT=80 si dédié au VPS, sinon 8080 derrière le nginx hôte
+      - "${WEB_PORT:-80}:80"
+
+volumes:
+  postgres_data:
+  backend_uploads:
